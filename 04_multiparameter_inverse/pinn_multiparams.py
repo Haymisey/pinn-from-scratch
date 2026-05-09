@@ -14,7 +14,7 @@ A_TRUE     = 0.5
 N_COLLOC    = 8000
 N_SENSORS   = 20
 NOISE_LEVEL = 0.01
-EPOCHS_ADAM = 12000
+EPOCHS_ADAM = 20000
 LR          = 1e-3
 
 
@@ -29,7 +29,8 @@ def exact_solution(x, t, alpha=ALPHA_TRUE, A=A_TRUE):
 x_sensors = torch.rand(N_SENSORS, 1)
 t_sensors = torch.rand(N_SENSORS, 1)
 u_exact_s = exact_solution(x_sensors, t_sensors)
-u_sensors = u_exact_s + NOISE_LEVEL * torch.randn_like(u_exact_s)
+noise_scale = NOISE_LEVEL * torch.abs(u_exact_s)
+u_sensors = u_exact_s + noise_scale * torch.randn_like(u_exact_s)
 
 print("=" * 60)
 print("MULTI-PARAMETER INVERSE PROBLEM")
@@ -82,22 +83,26 @@ def physics_residual(model, x, t):
     source = model.A * torch.sin(np.pi * x)
     return u_t - model.alpha * u_xx - source
 
-# 5. TRAINING POINTS
+# 5. DYNAMIC TRAINING POINTS GENERATOR
+def generate_points():
+    x_col = torch.rand(N_COLLOC, 1)
+    t_col = torch.rand(N_COLLOC, 1)
 
-x_col = torch.rand(N_COLLOC, 1)
-t_col = torch.rand(N_COLLOC, 1)
+    t_bc  = torch.rand(300, 1)
+    x_bc0 = torch.zeros(300, 1)
+    x_bc1 = torch.ones(300, 1)
 
-t_bc  = torch.rand(300, 1)
-x_bc0 = torch.zeros(300, 1)
-x_bc1 = torch.ones(300, 1)
+    x_ic  = torch.rand(300, 1)
+    t_ic  = torch.zeros(300, 1)
+    u_ic  = torch.sin(np.pi * x_ic)   # u(x,0) = sin(pi*x)
+    
+    return x_col, t_col, t_bc, x_bc0, x_bc1, x_ic, t_ic, u_ic
 
-x_ic  = torch.rand(300, 1)
-t_ic  = torch.zeros(300, 1)
-u_ic  = torch.sin(np.pi * x_ic)   # u(x,0) = sin(pi*x)
+# Generate initial points
+x_col, t_col, t_bc, x_bc0, x_bc1, x_ic, t_ic, u_ic = generate_points()
 
-
-# 6. LOSS FUNCTION
-def compute_loss(model):
+# 6. RAW LOSS FUNCTION (No hardcoded weights here anymore)
+def compute_loss_components(model, x_col, t_col, t_bc, x_bc0, x_bc1, x_ic, t_ic, u_ic):
     # PDE residual
     res      = physics_residual(model, x_col, t_col)
     loss_pde = torch.mean(res**2)
@@ -109,55 +114,95 @@ def compute_loss(model):
     # Initial condition
     loss_ic  = torch.mean((model(x_ic, t_ic) - u_ic)**2)
 
-    # Weighted sensor loss (trust high-amplitude sensors more)
+    # Data loss (No hardcoded 10.0 weight)
     u_pred    = model(x_sensors, t_sensors)
     residuals = (u_pred - u_sensors)**2
     weights   = torch.abs(u_sensors).detach()
     weights   = weights / weights.sum()
     loss_data = torch.sum(weights * residuals)
 
-    total = loss_pde + loss_bc + loss_ic + 10.0 * loss_data
-    return total, loss_pde, loss_bc, loss_ic, loss_data
+    return loss_pde, loss_bc, loss_ic, loss_data
 
 
-# 7. PHASE 1 — ADAM
+# 7. PHASE 1 — ADAM WITH GRADIENT ANNEALING & DYNAMIC POINTS
 
 model     = PINN()
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
-                                             step_size=3000, gamma=0.5)
+optimizer = torch.optim.Adam([
+    {'params': model.net.parameters(), 'lr': 1e-3},
+    {'params': [model.alpha],          'lr': 5e-4}, 
+    {'params': [model.A],              'lr': 2e-3}, 
+], lr=1e-3)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3000, gamma=0.5)
 
-alpha_history = []
-A_history     = []
-loss_history  = []
+alpha_history, A_history, loss_history  = [], [], []
+
+# Initialize dynamic loss weights
+w_bc, w_ic, w_data = 1.0, 1.0, 10.0  # Starting guesses
+alpha_ema = 0.9                      # Exponential Moving Average factor for stability
 
 print(f"\nPHASE 1: Adam — {EPOCHS_ADAM} epochs")
-print(f"Start: alpha={model.alpha.item():.3f} (true={ALPHA_TRUE})  "
-      f"A={model.A.item():.3f} (true={A_TRUE})\n")
 
 for epoch in range(EPOCHS_ADAM):
+    # --- DYNAMIC RESAMPLING ---
+    # Resample spatial/temporal domains every 100 epochs
+    if epoch % 100 == 0:
+        x_col, t_col, t_bc, x_bc0, x_bc1, x_ic, t_ic, u_ic = generate_points()
+    
+    # --- GRADIENT ANNEALING (Wang et al.) ---
+    # Update loss weights dynamically every 100 epochs to balance gradient flow
+    if epoch % 100 == 0 and epoch > 0:
+        optimizer.zero_grad()
+        l_pde, l_bc, l_ic, l_data = compute_loss_components(model, x_col, t_col, t_bc, x_bc0, x_bc1, x_ic, t_ic, u_ic)
+        
+        # 1. Get max gradient of the PDE loss w.r.t the last layer weights
+        l_pde.backward(retain_graph=True)
+        grad_pde = model.net[-1].weight.grad.abs().max().detach()
+        
+        # 2. Get mean gradients of the other losses
+        model.zero_grad(); l_data.backward(retain_graph=True)
+        grad_data = model.net[-1].weight.grad.abs().mean().detach()
+        
+        model.zero_grad(); l_bc.backward(retain_graph=True)
+        grad_bc = model.net[-1].weight.grad.abs().mean().detach()
+        
+        model.zero_grad(); l_ic.backward(retain_graph=True)
+        grad_ic = model.net[-1].weight.grad.abs().mean().detach()
+        
+        # 3. Update weights using Exponential Moving Average
+        # Formula: weight = target_grad / (current_grad + epsilon)
+        w_data = alpha_ema * w_data + (1 - alpha_ema) * (grad_pde / (grad_data + 1e-8)).item()
+        w_bc   = alpha_ema * w_bc   + (1 - alpha_ema) * (grad_pde / (grad_bc + 1e-8)).item()
+        w_ic   = alpha_ema * w_ic   + (1 - alpha_ema) * (grad_pde / (grad_ic + 1e-8)).item()
+        
+        model.zero_grad() # Clean up before actual training step
+
+    # --- STANDARD TRAINING STEP ---
     optimizer.zero_grad()
-    loss, loss_pde, loss_bc, loss_ic, loss_data = compute_loss(model)
+    l_pde, l_bc, l_ic, l_data = compute_loss_components(model, x_col, t_col, t_bc, x_bc0, x_bc1, x_ic, t_ic, u_ic)
+    
+    # Apply dynamically updated weights
+    loss = l_pde + (w_bc * l_bc) + (w_ic * l_ic) + (w_data * l_data)
+    
     loss.backward()
     optimizer.step()
     scheduler.step()
 
+    # Parameter Clamping
+    with torch.no_grad():
+        model.alpha.clamp_(0.01, 2.0)
+        model.A.clamp_(-5.0, 5.0)
+
+    # Logging
     alpha_history.append(model.alpha.item())
     A_history.append(model.A.item())
     loss_history.append(loss.item())
 
     if epoch % 2000 == 0:
-        print(f"Epoch {epoch:5d} | "
-              f"alpha={model.alpha.item():.6f} (err={abs(model.alpha.item()-ALPHA_TRUE)/ALPHA_TRUE*100:.2f}%) | "
-              f"A={model.A.item():.6f} (err={abs(model.A.item()-A_TRUE)/A_TRUE*100:.2f}%) | "
-              f"Loss={loss.item():.6f}")
+        print(f"Epoch {epoch:5d} | Loss: {loss.item():.5f} | "
+              f"α={model.alpha.item():.5f} | A={model.A.item():.5f} | "
+              f"w_data={w_data:.1f}")
 
-print(f"\nAdam done.")
-print(f"  alpha = {model.alpha.item():.6f}  "
-      f"(error: {abs(model.alpha.item()-ALPHA_TRUE)/ALPHA_TRUE*100:.3f}%)")
-print(f"  A     = {model.A.item():.6f}  "
-      f"(error: {abs(model.A.item()-A_TRUE)/A_TRUE*100:.3f}%)")
-
+print("\nAdam done.")
 
 # 8. PHASE 2 — L-BFGS
 
@@ -177,8 +222,22 @@ lbfgs_alpha, lbfgs_A = [], []
 
 def closure():
     optimizer_lbfgs.zero_grad()
-    loss, *_ = compute_loss(model)
+    
+    # 1. Pass all the dynamically generated points to the function
+    l_pde, l_bc, l_ic, l_data = compute_loss_components(
+        model, x_col, t_col, t_bc, x_bc0, x_bc1, x_ic, t_ic, u_ic
+    )
+    
+    # 2. Combine the loss using the final weights learned from Adam
+    loss = l_pde + (w_bc * l_bc) + (w_ic * l_ic) + (w_data * l_data)
+    
     loss.backward()
+    
+    # 3. Parameter Clamping
+    with torch.no_grad():
+        model.alpha.clamp_(0.01, 2.0)
+        model.A.clamp_(-5.0, 5.0)
+        
     lbfgs_alpha.append(model.alpha.item())
     lbfgs_A.append(model.A.item())
     return loss
