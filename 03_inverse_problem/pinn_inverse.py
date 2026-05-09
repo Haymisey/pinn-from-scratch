@@ -10,7 +10,7 @@ np.random.seed(42)
 ALPHA_TRUE  = 0.4
 N_COLLOC    = 5000
 N_SENSORS   = 15      # more sensors to average out noise
-NOISE_LEVEL = 0.01    # 1% noise — more realistic
+NOISE_LEVEL = 0.001    
 EPOCHS_ADAM = 8000
 LR          = 1e-3
 
@@ -87,6 +87,12 @@ def compute_loss(model):
 
     loss_data = torch.mean((model(x_sensors, t_sensors) - u_sensors)**2)
 
+    #WEIGHTED sensor loss — trust high-amplitude sensors more
+    u_pred_sensors = model(x_sensors, t_sensors)
+    residuals      = (u_pred_sensors - u_sensors)**2
+    weights        = torch.abs(u_sensors).detach()
+    weights        = weights / weights.sum()        # normalize
+    loss_data      = torch.sum(weights * residuals) # weighted MSE
     return loss_pde + loss_bc + loss_ic + 10.0 * loss_data, \
            loss_pde, loss_bc, loss_ic, loss_data
 
