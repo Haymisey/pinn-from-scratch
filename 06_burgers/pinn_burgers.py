@@ -54,7 +54,7 @@ def exact_burgers(x, t, nu=NU, n_terms=100):
 
     # phi0(s) = exp(-integral_0^s u(s',0) ds' / (2*nu))
     # For u(x,0) = -sin(pi*x):  integral = cos(pi*s)/pi
-    phi0 = np.exp(np.cos(np.pi * s) / (2 * np.pi * nu))
+    phi0 = np.exp(-np.cos(np.pi * s) / (2 * np.pi * nu))
 
     for i in range(len(x)):
         xi, ti = x[i], t[i]
