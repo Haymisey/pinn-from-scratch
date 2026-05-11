@@ -16,7 +16,7 @@ np.random.seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# ── Config ───────────────────────────────────────────────────
+#Config 
 NU          = 0.01 / np.pi   # small viscosity → thin shock
 N_COLLOC    = 20000          # need lots of points for nonlinear PDE
 N_BC        = 500
@@ -25,52 +25,39 @@ EPOCHS_ADAM = 15000
 LR          = 1e-3
 
 
-# 1. EXACT SOLUTION via Cole-Hopf transformation
-#    Used only for verification — PINN never sees this
-def exact_burgers(x, t, nu=NU, n_terms=100):
-    """
-    Exact solution via Fourier series / Cole-Hopf.
-    Reference: Basdevant et al. (1986)
-    """
+# 1. EXACT SOLUTION via Cole-Hopf transformation (Stabilized)
+def exact_burgers(x, t, nu=NU):
     if isinstance(x, torch.Tensor):
         x = x.numpy()
     if isinstance(t, torch.Tensor):
         t = t.numpy()
 
     u = np.zeros_like(x, dtype=float)
-
-    # Cole-Hopf: u = -2*nu * phi_x / phi
-    # phi(x,t) = sum_n a_n * exp(-n^2*pi^2*nu*t) * cos(n*pi*x)  [even terms]
-    #          + sum_n b_n * exp(-n^2*pi^2*nu*t) * sin(n*pi*x)  [odd terms]
-    # For IC u(x,0) = -sin(pi*x), the exact form is:
-
-    # Numerically integrate using the heat equation Green's function
-    # phi(x,t) = integral exp(-cos(pi*s)/(2*pi*nu)) * G(x-s,t) ds
-    # This is the most stable approach for small nu
-
-    n_quad = 1000
+    n_quad = 4000  # High resolution for the integral
     s = np.linspace(-1, 1, n_quad)
     ds = s[1] - s[0]
-
-    # phi0(s) = exp(-integral_0^s u(s',0) ds' / (2*nu))
-    # For u(x,0) = -sin(pi*x):  integral = cos(pi*s)/pi
-    phi0 = np.exp(-np.cos(np.pi * s) / (2 * np.pi * nu))
 
     for i in range(len(x)):
         xi, ti = x[i], t[i]
         if ti == 0:
             u[i] = -np.sin(np.pi * xi)
         else:
-            # Heat kernel: G(x-s, t) = exp(-(x-s)^2 / (4*nu*t))
-            G    = np.exp(-(xi - s)**2 / (4 * nu * ti))
-            phi  = np.sum(phi0 * G) * ds
-            # phi_x: d/dx of G
-            Gx   = -(xi - s) / (2 * nu * ti) * G
-            phix = np.sum(phi0 * Gx) * ds
-            u[i] = -2 * nu * phix / (phi + 1e-10)
-
+            # Combine both exponential terms into a single power E(s)
+            # The minus sign you caught is right here: -np.cos()
+            E = -np.cos(np.pi * s) / (2 * np.pi * nu) - ((xi - s)**2) / (4 * nu * ti)
+            
+            # The Trick: Shift by the max value to prevent computer underflow
+            E_max = np.max(E)
+            exp_E = np.exp(E - E_max)
+            
+            # Calculate the integrals
+            phi_bottom = np.sum(exp_E) * ds
+            phi_top    = np.sum(-(xi - s) / (2 * nu * ti) * exp_E) * ds
+            
+            # The E_max constants perfectly cancel out in division!
+            u[i] = -2 * nu * (phi_top / phi_bottom)
+            
     return u
-
 
 # 2. NETWORK — deeper for nonlinear problem
 class PINN(nn.Module):
